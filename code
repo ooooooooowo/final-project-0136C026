@@ -1,0 +1,320 @@
+
+import pandas as pd
+import numpy as np
+
+
+# ==========================================
+# 核心函式定義
+# ==========================================
+
+def get_financial_analysis(stock_id: str, start_date: str) -> pd.DataFrame:
+    """
+    從 FinMind 匯入財報數據，並計算毛利率、營益率、淨利率與 ROE
+    """
+    try:
+        from FinMind.data import DataLoader
+    except ImportError:
+        print("⚠️ FinMind 模組未安裝。請執行：pip install FinMind")
+        return pd.DataFrame()
+    
+    # 1. 初始化 FinMind 資料載入器
+    api = DataLoader()
+    
+    print(f"正在下載 {stock_id} 的損益表與資產負債表...")
+    
+    # 2. 下載綜合損益表
+    df_is = api.taiwan_stock_financial_statement(
+        stock_id=stock_id,
+        start_date=start_date
+    )
+    
+    # 3. 下載資產負債表
+    df_bs = api.taiwan_stock_balance_sheet(
+        stock_id=stock_id,
+        start_date=start_date
+    )
+    
+    # 4. 下載現金流量表
+    df_cf = api.taiwan_stock_cash_flows_statement(stock_id=stock_id, start_date=start_date)
+    
+    # 5. 下載股價數據
+    df_price = api.taiwan_stock_daily(stock_id=stock_id, start_date=start_date)
+    
+    # ==========================================
+    # 2. 資料結構轉置 (Pivot) 與清洗
+    # ==========================================
+    df_is_p = df_is.pivot_table(index='date', columns='type', values='value', aggfunc='first')
+    df_bs_p = df_bs.pivot_table(index='date', columns='type', values='value', aggfunc='first')
+    df_cf_p = df_cf.pivot_table(index='date', columns='type', values='value', aggfunc='first')
+    
+    # 確保總資產與負債科目存在
+    if df_is.empty or df_bs.empty or df_cf.empty:
+        print(f"⚠️ 警告: 股票代碼 {stock_id} 未能完整取得三張總報表。")
+        return pd.DataFrame()
+    if 'Asset' not in df_bs_p.columns and 'TotalAssets' in df_bs_p.columns:
+        df_bs_p['Asset'] = df_bs_p['TotalAssets']
+    if 'Liabilities' not in df_bs_p.columns and 'TotalLiabilities' in df_bs_p.columns:
+        df_bs_p['Liabilities'] = df_bs_p['TotalLiabilities']
+    
+    # 合併財報
+    df_financials = pd.merge(df_is_p, df_bs_p, left_index=True, right_index=True, how='inner')
+    df_financials = pd.merge(df_financials, df_cf_p, left_index=True, right_index=True, how='inner')
+    
+    # 處理股價數據
+    df_price['date'] = pd.to_datetime(df_price['date'])
+    df_financials.index = pd.to_datetime(df_financials.index)
+    
+    df_price_sorted = df_price.sort_values('date')
+    df_financials = df_financials.sort_index()
+    df_merged = pd.merge_asof(df_financials, df_price_sorted[['date', 'close']], 
+                              left_index=True, right_on='date', direction='backward').set_index('date')
+
+    # ==========================================
+    # 3. 核心指標計算
+    # ==========================================
+    analysis_df = pd.DataFrame(index=df_merged.index)
+    
+    # 安全除法
+    revenue_safe = df_merged['Revenue'].where(df_merged['Revenue'] != 0, 1)
+    equity_safe = df_merged['Equity'].where(df_merged['Equity'] != 0, 1)
+    
+    # 傳統 4 大獲利指標
+    analysis_df['毛利率 (%)'] = (df_merged['GrossProfit'] / revenue_safe) * 100
+    analysis_df['營業利益率 (%)'] = (df_merged['OperatingIncome'] / revenue_safe) * 100
+    analysis_df['稅後淨利率 (%)'] = (df_merged['IncomeAfterTaxes'] / revenue_safe) * 100
+    analysis_df['ROE (%)'] = (df_merged['IncomeAfterTaxes'] / equity_safe) * 100
+    
+    # 杜邦分析
+    total_assets = df_merged['Asset'] if 'Asset' in df_merged.columns else df_merged.get('TotalAssets', df_merged['Equity'])
+    total_assets_safe = total_assets.where(total_assets != 0, 1)
+    analysis_df['杜邦_資產週轉率 (次)'] = df_merged['Revenue'] / total_assets_safe
+    analysis_df['杜邦_權益乘數 (槓桿)'] = total_assets / equity_safe
+    
+    # ROIC 計算
+    profit_before_tax = df_merged['ProfitBeforeTax'] if 'ProfitBeforeTax' in df_merged.columns else df_merged['OperatingIncome']
+    profit_before_tax_safe = profit_before_tax.where(profit_before_tax != 0, 1)
+    
+    income_tax = df_merged['IncomeTaxExpense'] if 'IncomeTaxExpense' in df_merged.columns else pd.Series(0, index=df_merged.index)
+    raw_tax_rate = income_tax / profit_before_tax_safe
+    tax_rate = np.clip(raw_tax_rate, 0, 0.5)
+    nopat = df_merged['OperatingIncome'] * (1 - tax_rate)
+    
+    total_liabilities = df_merged['Liabilities'] if 'Liabilities' in df_merged.columns else (total_assets - df_merged['Equity'])
+    cash = df_merged['CashAndCashEquivalents'] if 'CashAndCashEquivalents' in df_merged.columns else pd.Series(0, index=df_merged.index)
+    invested_capital = total_liabilities + df_merged['Equity'] - cash
+    invested_capital = invested_capital.apply(lambda x: x if x > 0 else 1)
+    
+    analysis_df['ROIC (%)'] = (nopat / invested_capital) * 100
+    
+    # FCF Yield
+    ocf = df_merged['OperatingCashFlow'] if 'OperatingCashFlow' in df_merged.columns else pd.Series(0, index=df_merged.index)
+    if 'PropertyPlantAndEquipmentAcquisition' in df_merged.columns:
+        raw_capex = df_merged['PropertyPlantAndEquipmentAcquisition']
+    elif 'InvestmentCashFlow' in df_merged.columns:
+        raw_capex = df_merged['InvestmentCashFlow']
+    else:
+        raw_capex = pd.Series(0, index=df_merged.index)
+    capex = np.abs(raw_capex)
+    
+    fcf = ocf - capex
+    if 'ShareCapital' in df_merged.columns:
+        share_capital = df_merged['ShareCapital']
+    elif 'OrdinaryShare' in df_merged.columns:
+        share_capital = df_merged['OrdinaryShare']
+    else:
+        share_capital = pd.Series(0, index=df_merged.index)
+    market_cap = (share_capital / 10) * df_merged['close']
+    market_cap_safe = market_cap.where(market_cap != 0, 1)
+    
+    analysis_df['FCF 報酬率 (FCF Yield %)'] = (fcf / market_cap_safe) * 100
+    
+    # 特徵指標
+    ppe = df_merged['PropertyPlantAndEquipment'] if 'PropertyPlantAndEquipment' in df_merged.columns else pd.Series(0, index=df_merged.index)
+    analysis_df['特徵_固定資產密集度 (%)'] = (ppe / total_assets_safe) * 100
+    
+    if 'CostOfGoodsSold' in df_merged.columns:
+        cogs = np.abs(df_merged['CostOfGoodsSold'])
+    elif 'OperatingCosts' in df_merged.columns:
+        cogs = np.abs(df_merged['OperatingCosts'])
+    else:
+        cogs = pd.Series(1, index=df_merged.index)
+    cogs_safe = cogs.where(cogs != 0, 1)
+    
+    if 'Inventory' in df_merged.columns:
+        avg_inventory = df_merged['Inventory'].rolling(window=2, min_periods=1).mean()
+    else:
+        avg_inventory = pd.Series(0, index=df_merged.index)
+        
+    analysis_df['特徵_存貨週轉天數 (天)'] = (avg_inventory / cogs_safe) * 365
+    
+    rd_expense = df_merged['ResearchAndDevelopmentExpense'] if 'ResearchAndDevelopmentExpense' in df_merged.columns else pd.Series(0, index=df_merged.index)
+    rd_expense = np.abs(rd_expense)
+    analysis_df['特徵_研發費用率 (%)'] = (rd_expense / revenue_safe) * 100
+    
+    income_after_tax = df_merged['IncomeAfterTaxes'].where(df_merged['IncomeAfterTaxes'] != 0, 1)
+    analysis_df['特徵_營業現金流收現率 (倍)'] = ocf / income_after_tax
+    
+    depreciation = df_merged['DepreciationExpense'] if 'DepreciationExpense' in df_merged.columns else pd.Series(0, index=df_merged.index)
+    amortization = df_merged['AmortizationExpense'] if 'AmortizationExpense' in df_merged.columns else pd.Series(0, index=df_merged.index)
+    da = np.abs(depreciation + amortization)
+    da = da.apply(lambda x: x if x > 0 else 1)
+    analysis_df['輔助_CapEx對DA比率 (倍)'] = capex / da
+
+    return analysis_df.round(2).dropna(subset=['ROE (%)'])
+
+    
+def evaluate_stock_structure(analysis_df: pd.DataFrame, stock_id: str) -> dict:
+    """
+    承接基本面時間序列數據，執行結構性優化診斷與長期投資決策程序
+    """
+    print(f"\n[Engine] 啟動 {stock_id} 基本面因子結構性優化評估...")
+    
+    # 報告容器（先初始化，確保返回的字典始終有相同鍵）
+    report = {"stock_id": stock_id, "industry_type": "UNKNOWN", "diagnostics": {}, "decision": "HOLD"}
+    
+    if len(analysis_df) < 4 or (analysis_df.index[-1] - analysis_df.index[0]).days < 360:
+        report["decision"] = "INSUFFICIENT_DATA"
+        report["diagnostics"]["DataCheck"] = "需擁有一整年財務數據以進行結構性評估。"
+        return report
+        
+    initial_idx = analysis_df.index[0]
+    latest_idx = analysis_df.index[-1]
+    
+    em_initial = analysis_df.loc[initial_idx, '杜邦_權益乘數 (槓桿)']
+    em_latest = analysis_df.loc[latest_idx, '杜邦_權益乘數 (槓桿)']
+    em_change_pct = ((em_latest - em_initial) / em_initial) * 100
+    
+    roic_initial = analysis_df.loc[initial_idx, 'ROIC (%)']
+    roic_latest = analysis_df.loc[latest_idx, 'ROIC (%)']
+    
+    fixed_asset_ratio = analysis_df.loc[latest_idx, '特徵_固定資產密集度 (%)']
+    cash_realization = analysis_df.loc[latest_idx, '特徵_營業現金流收現率 (倍)']
+    rd_ratio = analysis_df.loc[latest_idx, '特徵_研發費用率 (%)']
+    capex_to_da = analysis_df.loc[latest_idx, '輔助_CapEx對DA比率 (倍)']
+    
+    # 通用安全閥檢驗
+    if em_change_pct < 0:
+        report["diagnostics"]["EM_Status"] = (
+            f"【優化】EM 從 {em_initial:.2f} 收斂至 {em_latest:.2f} (降幅 {em_change_pct:.2f}%)。 "
+            f"成功控制隨機波動度，股東權益的下行風險主動壓低了 {abs(em_change_pct):.2f}%，安全邊際擴大。"
+        )
+    else:
+        report["diagnostics"]["EM_Status"] = (
+            f"【警訊】EM 從 {em_initial:.2f} 上升至 {em_latest:.2f} (增幅 {em_change_pct:.2f}%)。 "
+            f"公司正在透過提高財務槓桿放大隨機波動度，需注意破產與財務困境成本。"
+        )
+
+    # 收現率檢驗
+    if cash_realization < 0.7:
+        report["diagnostics"]["Security_Alert"] = (
+            f"⚠️【財務安全警訊】營業現金流收現率僅 {cash_realization:.2f} 倍（低於 0.7 安全閥門），"
+            f"營運資金可能嚴重滯留在應收帳款或存貨黑洞，有紙面富貴風險。"
+        )
+    
+    # 產業分類與決策
+    if fixed_asset_ratio >= 35.0:
+        report["industry_type"] = "重資本/製造業"
+        report["diagnostics"]["Industry_Classification"] = f"📊 產業分類：【重資本/製造業】(固定資產密集度: {fixed_asset_ratio:.1f}%)"
+        
+        if roic_latest < 9.0 and capex_to_da > 1.2 and cash_realization > 1.0:
+            report["diagnostics"]["Cycle_Diagnosis"] = (
+                f"🟢 週期診斷：當前 ROIC 為 {roic_latest:.1f}%，雖低於傳統標準，但 CapEx/D&A 高達 {capex_to_da:.2f} 倍，"
+                f"顯示本業正大舉投資未來，且收現率健康。判定為『左側產能擴張黃金期』。"
+            )
+            report["decision"] = "STRONG_BUY_EXPANSION"
+        elif roic_latest > 12.0 and capex_to_da < 0.8:
+            report["diagnostics"]["Cycle_Diagnosis"] = (
+                f"💰 週期診斷：ROIC 達 {roic_latest:.1f}%（>12%），且 CapEx/D&A 回落至 {capex_to_da:.2f} 倍，"
+                f"折舊壓力減輕。判定為『產能循環收割爆發期』。"
+            )
+            report["decision"] = "STRONG_BUY_HARVEST"
+        elif roic_latest < 6.0:
+            report["diagnostics"]["Cycle_Diagnosis"] = (
+                f"🚨 週期診斷：ROIC 跌破 {roic_latest:.1f}% 且未見良性擴產特徵，屬於結構性衰退，排除投資。"
+            )
+            report["decision"] = "ABSOLUTE_EXCLUDE"
+        else:
+            report["diagnostics"]["Cycle_Diagnosis"] = (
+                f"ℹ️ 營運狀態：重資本常態營運，當前 ROIC 為 {roic_latest:.1f}%。"
+            )
+            report["decision"] = "HOLD_OR_WATCH"
+    else:
+        report["industry_type"] = "輕資產/高增長"
+        report["diagnostics"]["Industry_Classification"] = f"📊 產業分類：【輕資產/高增長】(固定資產密集度: {fixed_asset_ratio:.1f}%)"
+        
+        if rd_ratio > 5.0 and roic_latest > 15.0:
+            report["diagnostics"]["Growth_Profile"] = (
+                f"🚀 成長特徵：R&D 投入率高達 {rd_ratio:.1f}%，ROIC 優異 {roic_latest:.1f}%，"
+                f"符合高成長企業特徵，需關注營收成長率。"
+            )
+            report["decision"] = "STRONG_BUY_GROWTH"
+        else:
+            report["diagnostics"]["Growth_Profile"] = (
+                f"ℹ️ 輕資產營運模式，當前 ROIC 為 {roic_latest:.1f}%，R&D 占比 {rd_ratio:.1f}%。"
+            )
+            report["decision"] = "HOLD_OR_WATCH"
+
+    return report
+
+print("✅ 核心函式定義完成！")
+
+# ==========================================
+# 互動式股票分析：輸入股票代碼與日期
+# ==========================================
+
+print("=" * 70)
+print("股票基本面結構化評估系統 (Stock Fundamental Analysis Engine)")
+print("=" * 70)
+print("\n💡 說明：")
+print("  - 股票代碼：台灣上市公司代碼 (如: 2330=台積電, 2498=宏達電)")
+print("  - 開始日期：格式 YYYY-MM-DD (如: 2020-01-01)")
+print("  - 系統將從 FinMind 取得該股票的財務數據並進行結構性評估\n")
+
+# 使用者輸入
+stock_id = input("📌 請輸入股票代碼 (例: 2330): ").strip()
+start_date = input("📅 請輸入開始日期 YYYY-MM-DD (例: 2020-01-01): ").strip()
+
+# 輸入驗證
+if not stock_id:
+    print("❌ 錯誤：股票代碼不能為空")
+elif not start_date or len(start_date) != 10:
+    print("❌ 錯誤：日期格式不正確，請使用 YYYY-MM-DD 格式")
+else:
+    print(f"\n🔄 正在分析股票 {stock_id}（起始日期: {start_date}）...")
+    print("-" * 70)
+    
+    try:
+        # 呼叫財務分析函式
+        analysis_df = get_financial_analysis(stock_id, start_date)
+        
+        if analysis_df.empty:
+            print(f"⚠️ 警告：無法取得 {stock_id} 的完整財務數據，請檢查代碼或日期範圍")
+        else:
+            print(f"\n✅ 成功取得 {len(analysis_df)} 筆財務數據\n")
+            print("最近財務指標預覽：")
+            print(analysis_df.tail().to_string())
+            
+            # 呼叫結構性評估函式
+            print("\n" + "=" * 70)
+            evaluation_report = evaluate_stock_structure(analysis_df, stock_id)
+            
+            # 格式化輸出報告
+            print("\n📊 【評估報告】")
+            print("-" * 70)
+            print(f"股票代碼: {evaluation_report['stock_id']}")
+            print(f"產業類型: {evaluation_report['industry_type']}")
+            print(f"投資決策: {evaluation_report['decision']}")
+            print("\n📋 診斷詳情：")
+            if evaluation_report['diagnostics']:
+                for diagnostic_key, diagnostic_value in evaluation_report['diagnostics'].items():
+                    print(f"\n  {diagnostic_key}:")
+                    print(f"    {diagnostic_value}")
+            print("\n" + "=" * 70)
+    
+    except Exception as e:
+        print(f"❌ 執行出錯：{type(e).__name__}")
+        print(f"   詳情：{str(e)}")
+        print("\n💡 可能原因：")
+        print("   1. FinMind 模組未安裝 → 執行：pip install FinMind")
+        print("   2. 股票代碼不存在或資料不足")
+        print("   3. 網路連線問題或 API 暫時故障")
